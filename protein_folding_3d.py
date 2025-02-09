@@ -439,7 +439,7 @@ def optimize_protein(positions, n_beads, write_csv=False, maxiter=1000, tol=1e-6
         k_b=100.0,
         callback=callback,
         shake_interval=100,     # try a shake every 50 iterations
-        shake_scale=0.01,      # magnitude of the shake
+        shake_scale=0.03,      # magnitude of the shake
         reset_hessian_after_shake=False
     )
 
@@ -469,12 +469,12 @@ if __name__ == "__main__":
         plt.show()
 
     # Example usage
-    n_beads = 500
+    n_beads = 100
     initial_positions = initialize_protein(n_beads)
     E_initial = total_energy(initial_positions, n_beads)
     print(f"Initial energy: {E_initial:.6f}")
 
-    res, traj = optimize_protein(initial_positions, n_beads, write_csv=True, maxiter=10000, tol=1e-6)
+    res, traj = optimize_protein(initial_positions, n_beads, write_csv=True, maxiter=10000, tol=1e-4)
     print(f"Optimization done. #iterations={res.nit}, final E={res.fun:.6f}")
 
     # Plot final result
