@@ -1,7 +1,7 @@
 import numpy as np
 import os
 import ctypes
-
+np.random.seed(6)
 ############### LOAD C LIBRARY ###############
 # Adjust the path below if necessary
 # e.g. if the .so is in the same dir as this .py, use "./compute_energy.so"
@@ -283,7 +283,7 @@ def bfgs_minimize_shake_if_not_better(
                 noise = shake_scale2 * np.random.randn(dim)
                 x += noise
                 shakes_done += 1
-                print(f"Shaking (#{shakes_done}); new E={f:.6f}, gnorm={gnorm:.3e}")
+                #print(f"Shaking (#{shakes_done}); new E={f:.6f}, gnorm={gnorm:.3e}")
                 # Recompute after shake
                 f, g = compute_energy_and_gradient(
                        x.reshape(n_beads,3), n_beads, epsilon, sigma, b, k_b
@@ -359,8 +359,8 @@ def bfgs_minimize_shake_if_not_better(
             callback(x)
 
         # Optional debug printing
-        if iteration % 50 == 0:
-            print(f"Iteration {iteration}, E={f:.6f}, gnorm={gnorm:.3e}, bestE={lowest_energy:.6f}")
+       # if iteration % 50 == 0:
+           # print(f"Iteration {iteration}, E={f:.6f}, gnorm={gnorm:.3e}, bestE={lowest_energy:.6f}")
 
     # End of loop
     # Prepare final result
@@ -621,8 +621,8 @@ def optimize_protein(positions, n_beads, write_csv=False, maxiter=1000, tol=1e-6
         k_b=100.0,
         callback=callback,
         shake_interval = 100,
-        shake_scale1=0.03,
-        shake_scale2=0.15,
+        shake_scale1=0.02,
+        shake_scale2=0.1,
         max_shakes=5,
         reset_hessian_after_shake=False
     )
