@@ -203,6 +203,180 @@ def bfgs_minimize(
     )
     return result, trajectory
 
+def bfgs_minimize_shake_if_not_better(
+    x0,
+    n_beads,
+    maxiter=1000,
+    tol=1e-6,
+    epsilon=1.0,
+    sigma=1.0,
+    b=1.0,
+    k_b=100.0,
+    callback=None,
+    shake_scale=0.02,
+    max_shakes=5,
+    reset_hessian_after_shake=True
+):
+    """
+    BFGS that stops if we find a local min with E < best_so-far. 
+    If the new local min is NOT better, we do a "shake" and keep iterating, 
+    up to 'max_shakes' times.
+
+    The logic:
+      1) Keep a record of lowest_energy so far, lowest_x so far.
+      2) Each time we converge (gnorm <= tol), 
+         check if the final energy < 'lowest_energy'.
+         - If yes, update 'lowest_energy' and 'lowest_x'.
+         - If not better, do a random shake and continue BFGS 
+           (unless we've already done 'max_shakes' shakes, then stop).
+      3) If we run out of BFGS iterations or used up max_shakes, exit.
+
+    Returns:
+      (result, trajectory)
+
+      Where 'result' is a small object with .x, .fun, etc.
+      'trajectory' is a list of (n_beads,3) positions each iteration.
+    """
+
+    dim = x0.size
+    x = x0.copy()
+
+    # Evaluate initial energy and gradient
+    f, g = compute_energy_and_gradient(
+        x.reshape(n_beads, 3), n_beads, epsilon, sigma, b, k_b
+    )
+    gnorm = np.linalg.norm(g)
+
+    # Keep track of the best local min found so far
+    lowest_energy = f
+    lowest_x = x.copy()
+
+    # BFGS Hessian approximation
+    Hk = np.eye(dim)
+
+    iteration = 0
+    trajectory = [x.reshape(n_beads, 3).copy()]
+    if callback:
+        callback(x)
+
+    # We'll also track how many times we've already shaken
+    shakes_done = 0
+
+    # BFGS outer loop
+    while iteration < maxiter:
+        iteration += 1
+
+        # If we are "converged" by gradient norm, see if it's better than old best
+        if gnorm <= tol:
+            if f < lowest_energy:
+                # Great, we found a better local minimum
+                lowest_energy = f
+                lowest_x = x.copy()
+                # We can either keep going or break right away because we improved.
+                # Let's just keep going to see if we can do even better,
+                # unless you want to break immediately here.
+                pass
+            else:
+                # We did not improve upon 'lowest_energy'. 
+                # So let's see if we still have shakes left to try.
+                if shakes_done < max_shakes:
+                    # Shake
+                    noise = shake_scale * np.random.randn(dim)
+                    x += noise
+
+                    # Recompute after shake
+                    f, g = compute_energy_and_gradient(
+                        x.reshape(n_beads,3), n_beads, epsilon, sigma, b, k_b
+                    )
+                    gnorm = np.linalg.norm(g)
+
+                    if reset_hessian_after_shake:
+                        Hk = np.eye(dim)
+
+                    shakes_done += 1
+                    print(f"Shaking (#{shakes_done}); new E={f:.6f}, gnorm={gnorm:.3e}")
+                    
+                    # If after shaking we are STILL below tol, 
+                    # it means we basically remain in a local min. 
+                    # We can keep going or break. Let's keep going to let BFGS do its step.
+                else:
+                    # We have no shakes left; let's just break out.
+                    print("No shakes left, stopping.")
+                    break
+
+        # Normal BFGS step if we haven't decided to break
+        if gnorm <= tol and shakes_done >= max_shakes:
+            # We are converged and can't shake anymore -> stop
+            break
+
+        # Step 1: Compute direction p = -Hk * g
+        p = -Hk.dot(g)
+
+        # Step 2: Backtracking line search
+        alpha = 1.0
+        c1 = 1e-4
+        old_f = f
+        while True:
+            x_new = x + alpha * p
+            f_new, g_new = compute_energy_and_gradient(
+                x_new.reshape(n_beads,3), n_beads, epsilon, sigma, b, k_b
+            )
+            if f_new <= old_f + c1 * alpha * np.dot(g, p):
+                # Armijo satisfied
+                break
+            alpha *= 0.5
+            if alpha < 1e-16:
+                # step too small
+                break
+
+        # Step 3: BFGS update
+        s_k = x_new - x
+        y_k = g_new - g
+        rho = 1.0 / (np.dot(y_k, s_k) + 1e-16)
+
+        I = np.eye(dim)
+        A = I - rho * np.outer(s_k, y_k)
+        B = I - rho * np.outer(y_k, s_k)
+        Hk = A.dot(Hk).dot(B) + rho * np.outer(s_k, s_k)
+
+        # Step 4: Update
+        x = x_new
+        f = f_new
+        g = g_new
+        gnorm = np.linalg.norm(g)
+
+        trajectory.append(x.reshape(n_beads, 3).copy())
+
+        if callback:
+            callback(x)
+
+        # Optional debug printing
+        if iteration % 50 == 0:
+            print(f"Iteration {iteration}, E={f:.6f}, gnorm={gnorm:.3e}, bestE={lowest_energy:.6f}")
+
+    # End of loop
+    # Prepare final result
+    success = (gnorm <= tol)
+    message = "Converged" if success else "Max iterations or shakes exhausted."
+
+    # If you want to return the absolutely best known positions:
+    #    best_x = lowest_x
+    #    best_f = lowest_energy
+    # rather than x, f. 
+    # But typically the result.x is your final positions. 
+    # It's your choice:
+
+    # Let's store the final positions, 
+    # but also store the best known local min in .fun
+    result = CustomOptimizeResult(
+        x=x,            # final positions
+        success=success,
+        message=message,
+        niter=iteration,
+        fun=f           # final energy
+    )
+    return result, trajectory
+
 def bfgs_minimize_shaken(
     x0,
     n_beads,
@@ -428,18 +602,18 @@ def optimize_protein(positions, n_beads, write_csv=False, maxiter=1000, tol=1e-6
         trajectory.append(x.reshape((n_beads,3)).copy())
 
     x0 = positions.flatten()
-    result, traj = bfgs_minimize_shaken(
+    result, traj = bfgs_minimize_shake_if_not_better(
         x0,
-        n_beads=n_beads,
-        maxiter=maxiter,
+        n_beads,
+        maxiter=maxiter,   # <--- use the parameter
         tol=tol,
         epsilon=1.0,
         sigma=1.0,
         b=1.0,
         k_b=100.0,
         callback=callback,
-        shake_interval=100,     # try a shake every 50 iterations
-        shake_scale=0.03,      # magnitude of the shake
+        shake_scale=0.03,
+        max_shakes=5,
         reset_hessian_after_shake=False
     )
 
@@ -474,7 +648,7 @@ if __name__ == "__main__":
     E_initial = total_energy(initial_positions, n_beads)
     print(f"Initial energy: {E_initial:.6f}")
 
-    res, traj = optimize_protein(initial_positions, n_beads, write_csv=True, maxiter=10000, tol=1e-4)
+    res, traj = optimize_protein(initial_positions, n_beads, write_csv=False, maxiter=10000, tol=1e-4)
     print(f"Optimization done. #iterations={res.nit}, final E={res.fun:.6f}")
 
     # Plot final result
