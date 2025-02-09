@@ -1,27 +1,13 @@
-CXX = g++
-CXXFLAGS = -Wall -ggdb3 -O5
-LDFLAGS = -L. -lm
+# A simple Makefile that compiles our C code into a shared library usable by Python (ctypes)
 
-all: libenergy.so grad_w_armijo bfgs_w_classes bfgs_w_varargs
+CC = gcc
+CFLAGS = -O3 -fPIC
+LIBNAME = compute_energy.so
 
-libenergy.so: energy.cpp energy.hpp
-	$(CXX) $(CXXFLAGS) -shared -o libenergy.so -fPIC energy.cpp
+all: $(LIBNAME)
 
-grad_w_armijo: libenergy.so grad_w_armijo.o 
-	$(CXX) $(CXXFLAGS) grad_w_armijo.o -o grad_w_armijo  $(LDFLAGS) -lenergy
+$(LIBNAME): compute_energy.c compute_energy.h
+	$(CC) $(CFLAGS) -shared -o $(LIBNAME) compute_energy.c
 
-
-bfgs_w_classes: bfgs_w_classes.o
-	$(CXX) $(CXXFLAGS) bfgs_w_classes.o -o bfgs_w_classes  $(LDFLAGS)
-
-bfgs_w_varargs: bfgs_w_varargs.o
-	$(CC) $(CFFLAGS) bfgs_w_varargs.o -o bfgs_w_varargs  $(LDFLAGS)
-
-
-clean: FORCE
-	@-rm libenergy.so
-	@-rm grad_w_armijo
-	@-rm grad_w_varargs
-	@-rm grad_w_classes
-
-FORCE:
+clean:
+	rm -f *.o *.so

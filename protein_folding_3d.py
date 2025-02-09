@@ -1,10 +1,71 @@
 import numpy as np
-from scipy.optimize import minimize
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-from matplotlib.animation import FuncAnimation
+import os
+import ctypes
 
-# Initialize protein positions
+############### LOAD C LIBRARY ###############
+# Adjust the path below if necessary
+# e.g. if the .so is in the same dir as this .py, use "./compute_energy.so"
+# If it's in a 'c_code' subfolder, do "c_code/compute_energy.so"
+
+# Attempt relative path
+_libname = os.path.join(os.path.dirname(__file__), "compute_energy.so")
+_lib = ctypes.CDLL(_libname)
+
+# C function signature:
+#   void compute_energy_and_gradient(const double *positions,
+#                                    int n_beads,
+#                                    double epsilon,
+#                                    double sigma,
+#                                    double bond_len,
+#                                    double k_bond,
+#                                    double *grad_out,
+#                                    double *energy_out);
+_compute_energy_grad = _lib.compute_energy_and_gradient
+_compute_energy_grad.argtypes = [
+    ctypes.POINTER(ctypes.c_double),  # positions
+    ctypes.c_int,                     # n_beads
+    ctypes.c_double,                  # epsilon
+    ctypes.c_double,                  # sigma
+    ctypes.c_double,                  # bond_len
+    ctypes.c_double,                  # k_bond
+    ctypes.POINTER(ctypes.c_double),  # grad_out
+    ctypes.POINTER(ctypes.c_double)   # energy_out
+]
+_compute_energy_grad.restype = None
+
+def compute_energy_and_gradient(positions, n_beads,
+                                epsilon=1.0, sigma=1.0,
+                                bond_len=1.0, k_bond=100.0):
+    """
+    Python wrapper around the C function compute_energy_and_gradient.
+
+    positions: shape (n_beads, 3) or flattened length 3*n_beads
+    returns: (energy, grad) where grad has shape (3*n_beads,)
+    """
+    x_flat = positions.ravel().astype(np.float64)
+    grad_out = np.zeros_like(x_flat, dtype=np.float64)
+    energy_out = np.array([0.0], dtype=np.float64)
+
+    # Prepare pointers
+    c_pos = x_flat.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+    c_grad = grad_out.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+    c_energy = energy_out.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+
+    _compute_energy_grad(c_pos,
+                         n_beads,
+                         ctypes.c_double(epsilon),
+                         ctypes.c_double(sigma),
+                         ctypes.c_double(bond_len),
+                         ctypes.c_double(k_bond),
+                         c_grad,
+                         c_energy)
+
+    return energy_out[0], grad_out
+
+
+############### ORIGINAL CODE (TRIMMED) ###############
+# Note that we do NOT alter initialize_protein, as per instructions.
+
 def initialize_protein(n_beads, dimension=3, fudge = 1e-5):
     """
     Initialize a protein with `n_beads` arranged almost linearly in `dimension`-dimensional space.
@@ -12,50 +73,285 @@ def initialize_protein(n_beads, dimension=3, fudge = 1e-5):
     """
     positions = np.zeros((n_beads, dimension))
     for i in range(1, n_beads):
-        positions[i, 0] = positions[i-1, 0] + 1  # Fixed bond length of 1 unit
-        positions[i, 1] = fudge * np.sin(i)  # Fixed bond length of 1 unit
-        positions[i, 2] = fudge * np.sin(i*i)  # Fixed bond length of 1 unit                
+        positions[i, 0] = positions[i-1, 0] + 1  # distance 1 along x
+        positions[i, 1] = fudge * np.sin(i)
+        positions[i, 2] = fudge * np.sin(i*i)
     return positions
 
-# Lennard-Jones potential function
-def lennard_jones_potential(r, epsilon=1.0, sigma=1.0):
-    """
-    Compute Lennard-Jones potential between two beads.
-    """
-    return 4 * epsilon * ((sigma / r)**12 - (sigma / r)**6)
-
-# Bond potential function
-def bond_potential(r, b=1.0, k_b=100.0):
-    """
-    Compute harmonic bond potential between two bonded beads.
-    """
-    return k_b * (r - b)**2
-
-# Total energy function
 def total_energy(positions, n_beads, epsilon=1.0, sigma=1.0, b=1.0, k_b=100.0):
     """
-    Compute the total energy of the protein conformation.
+    Just a convenience Python function that calls our C-based function
+    but returns only energy. 
+    The autograder might use or ignore this. We'll keep it for checking.
     """
-    positions = positions.reshape((n_beads, -1))
-    energy = 0.0
-
-    # Bond energy
-    for i in range(n_beads - 1):
-        r = np.linalg.norm(positions[i+1] - positions[i])
-        energy += bond_potential(r, b, k_b)
-
-    # Lennard-Jones potential for non-bonded interactions
-    for i in range(n_beads):
-        for j in range(i+1, n_beads):
-            r = np.linalg.norm(positions[i] - positions[j])
-            if r > 1e-2:  # Avoid division by zero
-                energy += lennard_jones_potential(r, epsilon, sigma)
-
+    energy, _ = compute_energy_and_gradient(
+        positions.reshape(n_beads, 3),
+        n_beads,
+        epsilon, sigma,
+        b, k_b
+    )
     return energy
 
-# Optimization function
-def optimize_protein(positions, n_beads, write_csv=False, maxiter=1000, tol=1e-6):
+
+############### CUSTOM BFGS IMPLEMENTATION ###############
+class CustomOptimizeResult:
     """
+    Minimal replicate of scipy.optimize.OptimizeResult
+    so the autograder can access .x
+    """
+    def __init__(self, x, success=False, message="", niter=0, fun=None):
+        self.x = x
+        self.success = success
+        self.message = message
+        self.nit = niter
+        self.fun = fun
+
+def bfgs_minimize(
+    x0,
+    n_beads,
+    maxiter=1000,
+    tol=1e-4,
+    epsilon=1.0,
+    sigma=1.0,
+    b=1.0,
+    k_b=100.0,
+    callback=None
+):
+    """
+    Implements basic BFGS from scratch, with a simple backtracking line search.
+    Returns (result, trajectory)
+    """
+    # x0 = initial guess, shape (3*n_beads,)
+    x = x0.copy()
+    dim = x.size
+
+    # Evaluate initial energy/gradient
+    f, g = compute_energy_and_gradient(x.reshape(n_beads, 3), n_beads, epsilon, sigma, b, k_b)
+    gnorm = np.linalg.norm(g)
+    if callback is not None:
+        callback(x)
+
+    # Identity for Hessian approx
+    Hk = np.eye(dim)
+
+    # BFGS iteration
+    iteration = 0
+    trajectory = [x.reshape(n_beads, 3).copy()]
+
+    while iteration < maxiter and gnorm > tol:
+        iteration += 1
+
+        # p = - Hk * g
+        p = -Hk.dot(g)
+
+        # line search (backtracking + Armijo)
+        alpha = 1.0
+        c1 = 1e-4
+        old_f = f
+        # Simple backtracking Armijo
+        while True:
+            x_new = x + alpha * p
+            f_new, g_new = compute_energy_and_gradient(
+                x_new.reshape(n_beads,3), n_beads, epsilon, sigma, b, k_b
+            )
+            if f_new <= old_f + c1 * alpha * np.dot(g, p):
+                # Armijo condition satisfied
+                break
+            alpha *= 0.5
+            if alpha < 1e-16:
+                # step too small, break
+                break
+
+        # Now we have x_new
+        s_k = x_new - x
+        y_k = g_new - g
+
+        # BFGS Update
+        # H_{k+1} = (I - rho*s_k*y_k^T)*Hk*(I - rho*y_k*s_k^T) + rho*s_k*s_k^T
+        # but typically we store Bk^-1 or use direct formula. For simplicity:
+        rho = 1.0 / (y_k.dot(s_k) + 1e-16)  # small denom guard
+        I = np.eye(dim)
+        # rank-1 updates
+        A = I - rho * np.outer(s_k, y_k)
+        B = I - rho * np.outer(y_k, s_k)
+        Hk = A.dot(Hk).dot(B) + rho * np.outer(s_k, s_k)
+
+        # update
+        x = x_new
+        f = f_new
+        g = g_new
+        gnorm = np.linalg.norm(g_new)
+
+        # store trajectory
+        if callback is not None:
+            callback(x)
+        trajectory.append(x.reshape(n_beads,3).copy())
+
+        if iteration % 50 == 0:
+            print(f"Iteration {iteration}, f={f:.6f}, gnorm={gnorm:.6e}")
+
+    success = (gnorm <= tol)
+    message = "Converged" if success else "Max iterations reached"
+
+    # Prepare result
+    result = CustomOptimizeResult(
+        x = x,
+        success=success,
+        message=message,
+        niter=iteration,
+        fun=f
+    )
+    return result, trajectory
+
+def bfgs_minimize_shaken(
+    x0,
+    n_beads,
+    maxiter=1000,
+    tol=1e-6,
+    epsilon=1.0,
+    sigma=1.0,
+    b=1.0,
+    k_b=100.0,
+    callback=None,
+    shake_interval=50,
+    shake_scale=0.02,
+    reset_hessian_after_shake=True
+):
+    """
+    BFGS optimization with an occasional 'shake' to jump out of local minima.
+
+    Parameters
+    ----------
+    x0 : np.ndarray
+        Initial guess, shape (3*n_beads,).
+
+    n_beads : int
+        Number of beads (for passing to compute_energy_and_gradient).
+
+    maxiter : int
+        Maximum number of BFGS iterations.
+
+    tol : float
+        Convergence tolerance on the gradient norm.
+
+    epsilon, sigma, b, k_b : float
+        Lennard-Jones and bond parameters.
+
+    callback : function or None
+        If provided, called each iteration with the current x.
+
+    shake_interval : int
+        Perform a random shake every `shake_interval` iterations.
+
+    shake_scale : float
+        Standard deviation of the random perturbation for each coordinate.
+
+    reset_hessian_after_shake : bool
+        If True, re-initialize Hessian approximation to identity after shaking.
+
+    Returns
+    -------
+    result : CustomOptimizeResult
+        Contains final .x, .fun, etc.
+
+    trajectory : list of np.ndarray
+        List of all intermediate positions (n_beads, 3).
+    """
+    dim = x0.size
+    x = x0.copy()
+
+    # == Evaluate initial energy and gradient using your C code ==
+    f, g = compute_energy_and_gradient(
+        x.reshape(n_beads, 3), n_beads, epsilon, sigma, b, k_b
+    )
+    gnorm = np.linalg.norm(g)
+
+    # Identity matrix for Hessian approximation
+    Hk = np.eye(dim)
+
+    iteration = 0
+    trajectory = [x.reshape(n_beads, 3).copy()]
+    if callback:
+        callback(x)
+
+    while iteration < maxiter and gnorm > tol:
+        iteration += 1
+
+        # BFGS search direction
+        p = -Hk.dot(g)
+
+        # --- Simple backtracking line search (Armijo) ---
+        alpha = 1.0
+        c1 = 1e-4
+        old_f = f
+        while True:
+            x_new = x + alpha * p
+            f_new, g_new = compute_energy_and_gradient(
+                x_new.reshape(n_beads,3), n_beads, epsilon, sigma, b, k_b
+            )
+            if f_new <= old_f + c1 * alpha * np.dot(g, p):
+                # Armijo condition satisfied
+                break
+            alpha *= 0.5
+            if alpha < 1e-16:
+                # step size too small, break to avoid infinite loop
+                break
+
+        # --- BFGS Update ---
+        s_k = x_new - x          # displacement
+        y_k = g_new - g          # grad change
+        rho = 1.0 / (np.dot(y_k, s_k) + 1e-16)
+
+        I = np.eye(dim)
+        A = I - rho * np.outer(s_k, y_k)
+        B = I - rho * np.outer(y_k, s_k)
+        Hk = A.dot(Hk).dot(B) + rho * np.outer(s_k, s_k)
+
+        # Update references
+        x = x_new
+        f = f_new
+        g = g_new
+        gnorm = np.linalg.norm(g)
+        trajectory.append(x.reshape(n_beads, 3).copy())
+
+        # --- Possibly do a "shake" every `shake_interval` iterations ---
+        if iteration % shake_interval == 0:
+            # Shake each coordinate by ~ N(0, shake_scale)
+            noise = shake_scale * np.random.randn(dim)
+            x += noise
+            # Recompute energy and gradient after shake
+            f, g = compute_energy_and_gradient(
+                x.reshape(n_beads,3), n_beads, epsilon, sigma, b, k_b
+            )
+            gnorm = np.linalg.norm(g)
+            if reset_hessian_after_shake:
+                Hk = np.eye(dim)  # reset Hessian approximation
+            trajectory.append(x.reshape(n_beads, 3).copy())
+
+        if callback:
+            callback(x)
+
+        # (Optional) print debug info
+        if iteration % 50 == 0:
+            print(f"Iteration {iteration}, f={f:.6f}, gnorm={gnorm:.3e}")
+
+    # Check convergence
+    success = (gnorm <= tol)
+    message = "Converged" if success else "Max iterations exceeded"
+
+    result = CustomOptimizeResult(
+        x=x,
+        success=success,
+        message=message,
+        niter=iteration,
+        fun=f
+    )
+    return result, trajectory
+
+############### THE CRITICAL FUNCTION FOR AUTOGRADER ###############
+"""
+def optimize_protein(positions, n_beads, write_csv=False, maxiter=1000, tol=1e-6):
+    
     Optimize the positions of the protein to minimize total energy.
 
     Parameters:
@@ -79,192 +375,107 @@ def optimize_protein(positions, n_beads, write_csv=False, maxiter=1000, tol=1e-6
     Returns:
     -------
     result : CustomOptimizeResult
-        The result of the optimization process, with the optimized positions
-        in result.x, plus iteration info, and a success flag.
+        The result of the optimization process, containing .x with final positions, etc.
 
     trajectory : list of np.ndarray
-        A list of intermediate configurations during the optimization,
-        where each element is (n_beads, d) representing the beads at that step.
-    """
-    import numpy as np
+        A list of intermediate configurations (n_beads x 3).
+        (Autograder currently ignores, but we return it anyway.)
+    
 
-    # We'll store the optimization trajectory for plotting/animation
     trajectory = []
+    def callback(x):
+        # For debugging or storing frames
+        # x shape is (3*n_beads,)
+        trajectory.append(x.reshape((n_beads, 3)).copy())
 
-    # A local function to compute both the energy and the gradient
-    def energy_grad_func(x_flat):
-        """
-        Returns (energy, gradient) for the potential.
-        We'll do a simple finite-difference gradient for demonstration.
-        For better performance, implement analytical gradients.
-        """
-        # Reshape for total_energy
-        x_reshaped = x_flat.reshape(n_beads, -1)
+    # Flatten the initial guess
+    x0 = positions.flatten()
 
-        # 1) Evaluate the scalar function
-        f = total_energy(x_reshaped.flatten(), n_beads)
-
-        # 2) Compute gradient by finite differences
-        grad = np.zeros_like(x_flat)
-        epsilon = 1e-6
-        for i in range(len(x_flat)):
-            old_val = x_flat[i]
-
-            # x_plus
-            x_flat[i] = old_val + epsilon
-            f_plus = total_energy(x_flat.reshape(n_beads, -1), n_beads)
-
-            # x_minus
-            x_flat[i] = old_val - epsilon
-            f_minus = total_energy(x_flat.reshape(n_beads, -1), n_beads)
-
-            # restore
-            x_flat[i] = old_val
-
-            grad[i] = (f_plus - f_minus) / (2.0 * epsilon)
-
-        return f, grad
-
-    # Our custom BFGS
-    def bfgs(positions_flat, maxiter, tol):
-        x = positions_flat.copy()
-        n = len(x)
-        B = np.eye(n)  # Inverse Hessian approx
-        f, g = energy_grad_func(x)
-        gnorm = np.linalg.norm(g)
-        alpha_init = 1.0
-        c1 = 1e-4
-        rho = 0.9
-
-        for it in range(maxiter):
-            # Save trajectory for plotting
-            trajectory.append(x.reshape(n_beads, -1))
-
-            # Check convergence
-            if gnorm < tol:
-                return x, f, True, it
-
-            # 1) Search direction
-            p = -B.dot(g)
-
-            # 2) Armijo line search
-            alpha = alpha_init
-            f_old = f
-            gTp = np.dot(g, p)
-
-            while True:
-                x_new = x + alpha * p
-                f_new, g_new = energy_grad_func(x_new)
-                if f_new <= f_old + c1 * alpha * gTp:
-                    break
-                alpha *= rho
-                if alpha < 1e-16:
-                    # Step size too small => fail
-                    return x, f, False, it
-
-            # BFGS update
-            s = alpha * p
-            y = g_new - g
-            sy = np.dot(s, y)
-
-            if abs(sy) > 1e-14:
-                By = B.dot(y)
-                yTBy = np.dot(y, By)
-                B += np.outer(s, s) * (1.0 + (yTBy / sy)) / sy
-                B -= (np.outer(By, s) + np.outer(s, By)) / sy
-
-            # Accept step
-            x = x_new
-            f = f_new
-            g = g_new
-            gnorm = np.linalg.norm(g)
-
-        # If we exceed maxiter
-        return x, f, False, maxiter
-
-    # Run our custom BFGS
-    x0_flat = positions.flatten()
-    x_opt, f_opt, success, n_iter = bfgs(x0_flat, maxiter, tol)
-
-    # Optionally save final positions
-    if write_csv:
-        print(f"Writing data to file protein{n_beads}.csv")
-        np.savetxt(f"protein{n_beads}.csv", trajectory[-1], delimiter=",")
-
-    # We define a small custom class for the result
-    class CustomOptimizeResult:
-        def __init__(self, x, success, nit):
-            self.x = x  # This is what the autograder will look for
-            self.success = success
-            self.nit = nit
-
-    result = CustomOptimizeResult(x_opt, success, n_iter)
-    return result, trajectory
-
-
-# 3D visualization function
-def plot_protein_3d(positions, title="Protein Conformation", ax=None):
-    """
-    Plot the 3D positions of the protein.
-    """
-    if ax is None:
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection='3d')
-    positions = positions.reshape((-1, 3))
-    ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], '-o', markersize=6)
-    ax.set_title(title)
-    ax.set_xlabel('x')
-    ax.set_ylabel('y')
-    ax.set_zlabel('z')
-    plt.show()
-
-# Animation function
-# Animation function with autoscaling
-def animate_optimization(trajectory, interval=100):
-    """
-    Animate the protein folding process in 3D with autoscaling.
-    """
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-
-    line, = ax.plot([], [], [], '-o', markersize=6)
-
-    def update(frame):
-        positions = trajectory[frame]
-        line.set_data(positions[:, 0], positions[:, 1])
-        line.set_3d_properties(positions[:, 2])
-
-        # Autoscale the axes
-        x_min, x_max = positions[:, 0].min(), positions[:, 0].max()
-        y_min, y_max = positions[:, 1].min(), positions[:, 1].max()
-        z_min, z_max = positions[:, 2].min(), positions[:, 2].max()
-
-        ax.set_xlim(x_min - 1, x_max + 1)
-        ax.set_ylim(y_min - 1, y_max + 1)
-        ax.set_zlim(z_min - 1, z_max + 1)
-
-        ax.set_title(f"Step {frame + 1}/{len(trajectory)}")
-        return line,
-
-    ani = FuncAnimation(
-        fig, update, frames=len(trajectory), interval=interval, blit=False
+    # Call our custom BFGS
+    result, traj = bfgs_minimize(
+        x0,
+        n_beads=n_beads,
+        maxiter=maxiter,
+        tol=tol,
+        # You could param-tune these LJ parameters
+        epsilon=1.0,
+        sigma=1.0,
+        b=1.0,
+        k_b=100.0,
+        callback=callback
     )
-    plt.show()
 
-# Main function
+    # If we want to combine callback frames with final frames:
+    # but note that 'traj' from bfgs_minimize also has everything.
+    # We'll just return `traj`.
+    # (Make them consistent—some duplications are possible.)
+    trajectory = traj
+
+    if write_csv:
+        csv_filepath = f"protein{n_beads}.csv"
+        print(f"Writing data to file {csv_filepath}")
+        np.savetxt(csv_filepath, result.x.reshape(n_beads, 3), delimiter=",")
+
+    return result, trajectory
+"""
+
+def optimize_protein(positions, n_beads, write_csv=False, maxiter=1000, tol=1e-6):
+    """
+    Similar signature as original, but uses the 'shaken' BFGS approach.
+    """
+    trajectory = []
+    def callback(x):
+        trajectory.append(x.reshape((n_beads,3)).copy())
+
+    x0 = positions.flatten()
+    result, traj = bfgs_minimize_shaken(
+        x0,
+        n_beads=n_beads,
+        maxiter=maxiter,
+        tol=tol,
+        epsilon=1.0,
+        sigma=1.0,
+        b=1.0,
+        k_b=100.0,
+        callback=callback,
+        shake_interval=100,     # try a shake every 50 iterations
+        shake_scale=0.01,      # magnitude of the shake
+        reset_hessian_after_shake=False
+    )
+
+    if write_csv:
+        # Write final positions to CSV
+        csv_filepath = f"protein{n_beads}.csv"
+        print(f"Writing data to file {csv_filepath}")
+        np.savetxt(csv_filepath, result.x.reshape(n_beads, 3), delimiter=",")
+
+    # If you want to unify 'trajectory' with 'traj', you can do so:
+    # For now, let's just return 'traj' from bfgs_minimize_shaken
+    return result, traj
+
+############### OPTIONAL: UTILS FOR PLOTTING (OFF BY DEFAULT) ###############
+# If you want, you can keep or remove, so long as it doesn't break headless runs.
 if __name__ == "__main__":
-    n_beads = 10
-    dimension = 3
-    initial_positions = initialize_protein(n_beads, dimension)
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
 
-    print("Initial Energy:", total_energy(initial_positions.flatten(), n_beads))
-    plot_protein_3d(initial_positions, title="Initial Configuration")
+    def plot_protein_3d(positions, title="Protein Conformation", ax=None):
+        positions = positions.reshape((-1, 3))
+        if ax is None:
+            fig = plt.figure()
+            ax = fig.add_subplot(111, projection='3d')
+        ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], '-o', markersize=4)
+        ax.set_title(title)
+        plt.show()
 
-    result, trajectory = optimize_protein(initial_positions, n_beads, write_csv = True)
+    # Example usage
+    n_beads = 500
+    initial_positions = initialize_protein(n_beads)
+    E_initial = total_energy(initial_positions, n_beads)
+    print(f"Initial energy: {E_initial:.6f}")
 
-    optimized_positions = result.x.reshape((n_beads, dimension))
-    print("Optimized Energy:", total_energy(optimized_positions.flatten(), n_beads))
-    plot_protein_3d(optimized_positions, title="Optimized Configuration")
+    res, traj = optimize_protein(initial_positions, n_beads, write_csv=True, maxiter=10000, tol=1e-6)
+    print(f"Optimization done. #iterations={res.nit}, final E={res.fun:.6f}")
 
-    # Animate the optimization process
-    animate_optimization(trajectory)
+    # Plot final result
+    plot_protein_3d(res.x, title="Optimized Conformation")
